@@ -27,7 +27,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+from model import GPTConfig, GPT, PruneableGPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -77,6 +77,10 @@ config_keys = [k for k,v in globals().items() if not k.startswith('_') and isins
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
+
+# TODO: prune configs
+prunable = True
+model_cls = GPT if not prunable else PruneableGPT
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -179,7 +183,9 @@ elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
     override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
+    # model = GPT.from_pretrained(init_from, override_args)
+    model = model_cls.from_pretrained(init_from, override_args)
+
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
@@ -250,21 +256,8 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 
-
-prune_masks = {}
-cur_sizes = {}
-num_total_params = 0
-for name, param in model.state_dict.items():
-    if 'weight' not in name:
-        continue
-    size = torch.numel(param)
-    cur_sizes[name] = size
-    prune_masks[name] = torch.ones_like(param)
-    num_total_params += size
-
 prune_max_iter = 5
 prune_rate = 1 - 0.1 ** (1 / prune_max_iter)  # reach 10% of model in 5 iterations
-
 prune_iter = 0
 
 while True:
@@ -346,43 +339,13 @@ while True:
     # termination conditions
     if iter_num > max_iters:
         prune_iter += 1
-        if prune_iter > prune_max_iter:
+        if not prunable or prune_iter > prune_max_iter:
             break
-        if master_process:
-            print(f'pruning model to {(1 - prune_rate) ** prune_iter}x of original size')
-
         
-
-        for name, param in model.state_dict.items():
-            if 'weight' not in name:
-                continue
-            num_to_prune = int(cur_sizes[name] * prune_rate)
-            topk = torch.topk(torch.abs(param).view(-1), k=num_to_prune, largest=False)
-            prune_masks[name].view(-1)[topk.indices] = 0
-            
-            print(f'---- pruning {name}: {cur_sizes[name]} ==> {cur_sizes[name] - num_to_prune}')
-            cur_sizes[name] -= num_to_prune
-
-
+        model.prune(prune_rate)
 
         iter_num = 0
         local_iter_num = 0
-
-# max_, min_, mean_, num_params = -1, -1, -1, -1
-# for param in model.parameters():
-#     max_ = max(torch.max(torch.abs(param)).item(), max_)
-#     min_ = min(torch.min(torch.abs(param)).item(), min_)
-#     mean_ += torch.sum(torch.abs(param)).item()
-#     num_params += torch.numel(param)
-
-# mean_ /= num_params
-
-# print(f'Parameter Statistics:\n'
-#       f'====================\n'
-#       f'Max: {max_}\n'
-#       f'Min: {min_}\n'
-#       f'Mean: {mean_}\n'
-#       '====================')
 
 if ddp:
     destroy_process_group()
