@@ -249,6 +249,24 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+
+
+prune_masks = {}
+cur_sizes = {}
+num_total_params = 0
+for name, param in model.state_dict.items():
+    if 'weight' not in name:
+        continue
+    size = torch.numel(param)
+    cur_sizes[name] = size
+    prune_masks[name] = torch.ones_like(param)
+    num_total_params += size
+
+prune_max_iter = 5
+prune_rate = 1 - 0.1 ** (1 / prune_max_iter)  # reach 10% of model in 5 iterations
+
+prune_iter = 0
+
 while True:
 
     # determine and set the learning rate for this iteration
@@ -280,7 +298,7 @@ while True:
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                torch.save(checkpoint, os.path.join(out_dir, f'{(1 - prune_rate) ** prune_iter}_ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
 
@@ -327,7 +345,44 @@ while True:
 
     # termination conditions
     if iter_num > max_iters:
-        break
+        prune_iter += 1
+        if prune_iter > prune_max_iter:
+            break
+        if master_process:
+            print(f'pruning model to {(1 - prune_rate) ** prune_iter}x of original size')
+
+        
+
+        for name, param in model.state_dict.items():
+            if 'weight' not in name:
+                continue
+            num_to_prune = int(cur_sizes[name] * prune_rate)
+            topk = torch.topk(torch.abs(param).view(-1), k=num_to_prune, largest=False)
+            prune_masks[name].view(-1)[topk.indices] = 0
+            
+            print(f'---- pruning {name}: {cur_sizes[name]} ==> {cur_sizes[name] - num_to_prune}')
+            cur_sizes[name] -= num_to_prune
+
+
+
+        iter_num = 0
+        local_iter_num = 0
+
+# max_, min_, mean_, num_params = -1, -1, -1, -1
+# for param in model.parameters():
+#     max_ = max(torch.max(torch.abs(param)).item(), max_)
+#     min_ = min(torch.min(torch.abs(param)).item(), min_)
+#     mean_ += torch.sum(torch.abs(param)).item()
+#     num_params += torch.numel(param)
+
+# mean_ /= num_params
+
+# print(f'Parameter Statistics:\n'
+#       f'====================\n'
+#       f'Max: {max_}\n'
+#       f'Min: {min_}\n'
+#       f'Mean: {mean_}\n'
+#       '====================')
 
 if ddp:
     destroy_process_group()

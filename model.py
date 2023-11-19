@@ -130,6 +130,8 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+
+        self.transformer.wte.
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -328,3 +330,32 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+class PruneableGPT(GPT):
+    def __init__(self, config):
+        super().__init__(config)
+
+        self._sizes = {}
+        for name, param in self.named_parameters():
+            if 'weight' not in name:
+                continue
+            self.register_buffer(f'_{name}_pmask', torch.ones_like(param))
+            self._sizes[name] = torch.numel(param)
+
+    @torch.no_grad()
+    def prune(self, rate):
+        for name, param in self.named_parameters():
+            if 'weight' not in name:
+                continue
+            size = self._sizes[name]
+            num_to_prune = int(size * rate)
+            topk = torch.topk(torch.abs(param).view(-1), k=num_to_prune, largest=False)
+            
+            getattr(self, f'_{name}_pmask').view(-1)[topk.indices] = 0
+            
+            print(f'----pruning {name}: {size} ==> {size - num_to_prune}')
+    
+    def forward(self, idx, targets=None):
+        self.transformer.wte(idx)
+
+
