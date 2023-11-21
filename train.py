@@ -24,8 +24,11 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP
+)
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
+from torch.distributed import init_process_group, destroy_process_group, barrier
 
 from model import GPTConfig, GPT
 
@@ -72,6 +75,11 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False # use PyTorch 2.0 to compile the model to be faster
+
+## NEW FLAGS
+ddp = False
+fsdp = False
+
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -79,26 +87,27 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
 # various inits, derived attributes, I/O setup
-ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-if ddp:
+mult_gpus = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+
+if mult_gpus:
     init_process_group(backend=backend)
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
+    rank = int(os.environ['RANK'])
+    local_rank = int(os.environ['LOCAL_RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{local_rank}'
     torch.cuda.set_device(device)
-    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-    seed_offset = ddp_rank # each process gets a different seed
+    master_process = rank == 0 # this process will do logging, checkpointing etc.
+    seed_offset = rank # each process gets a different seed
     # world_size number of processes will be training simultaneously, so we can scale
     # down the desired gradient accumulation iterations per process proportionally
-    assert gradient_accumulation_steps % ddp_world_size == 0
-    gradient_accumulation_steps //= ddp_world_size
+    assert gradient_accumulation_steps % world_size == 0
+    gradient_accumulation_steps //= world_size
 else:
     # if not ddp, we are running on a single gpu, and one process
     master_process = True
     seed_offset = 0
-    ddp_world_size = 1
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
+    world_size = 1
+tokens_per_iter = gradient_accumulation_steps * world_size * batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
@@ -187,12 +196,16 @@ elif init_from.startswith('gpt2'):
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
-model.to(device)
+
+if ddp or not mult_gpus:
+    model.to(device)
+else:
+    model = FSDP(model, device_id=torch.cuda.current_device())
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
-# optimizer
+# TODO: check if optimizer works with flattened params
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
@@ -205,8 +218,8 @@ if compile:
     model = torch.compile(model) # requires PyTorch 2.0
 
 # wrap model into DDP container
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+if mult_gpus and ddp:
+    model = DDP(model, device_ids=[local_rank])
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -247,7 +260,8 @@ if wandb_log and master_process:
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
+# TODO: check if this unwrapping is needed with FSDP
+raw_model = model.module if mult_gpus and ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 while True:
 
@@ -257,6 +271,7 @@ while True:
         param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
+    # TODO: Add saving logic for FSDP models (check web tutorial)
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
@@ -286,8 +301,12 @@ while True:
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
+
+    print(f'Local iteration number {local_iter_num} ({device})')
+
     for micro_step in range(gradient_accumulation_steps):
-        if ddp:
+        # TODO: check if this gradient syncing is needed for FSDP
+        if mult_gpus and ddp:
             # in DDP training we only need to sync gradients at the last micro step.
             # the official way to do this is with model.no_sync() context manager, but
             # I really dislike that this bloats the code and forces us to repeat code
@@ -329,5 +348,7 @@ while True:
     if iter_num > max_iters:
         break
 
-if ddp:
+
+if mult_gpus:
+    barrier()
     destroy_process_group()

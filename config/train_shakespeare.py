@@ -13,7 +13,7 @@ wandb_project = 'shakespeare'
 wandb_run_name = 'ft-' + str(time.time())
 
 dataset = 'shakespeare'
-init_from = 'gpt2-medium' 
+init_from = 'gpt2' 
 
 # only save checkpoints if the validation loss improves
 always_save_checkpoint = False
@@ -28,3 +28,6 @@ max_iters = 200
 # finetune at constant LR
 learning_rate = 3e-5
 decay_lr = False
+
+ddp = False
+fsdp = True
