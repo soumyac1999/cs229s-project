@@ -200,6 +200,7 @@ if block_size < model.config.block_size:
 if ddp or not mult_gpus:
     model.to(device)
 else:
+    # TODO: need to figure out how to optimally use sharding strategy
     model = FSDP(model, device_id=torch.cuda.current_device())
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
