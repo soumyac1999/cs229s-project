@@ -258,6 +258,10 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+### Profiling data
+train_time_data = []
+inference_time_data = []
+
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
@@ -333,6 +337,7 @@ while True:
     # timing and logging
     t1 = time.time()
     dt = t1 - t0
+    train_time_data.append(dt)
     t0 = t1
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
@@ -349,6 +354,24 @@ while True:
     if iter_num > max_iters:
         break
 
+# inference loop
+X, Y = get_batch('val') # fetch the very first batch
+t0 = time.time()
+for _ in range(40):
+    with ctx:
+        logits, loss = model(X, Y)
+    X, Y = get_batch('val')
+
+    # timing and logging
+    t1 = time.time()
+    dt = t1 - t0
+    inference_time_data.append(dt)
+    t0 = t1
+
+### Print profiling data
+if master_process:
+    print("Average train time per iteration: ", np.mean(train_time_data[20:40]))
+    print("Average inference time per iteration: ", np.mean(inference_time_data[20:40]))
 
 if mult_gpus:
     barrier()
