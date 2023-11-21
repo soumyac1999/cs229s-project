@@ -355,18 +355,21 @@ while True:
         break
 
 # inference loop
-X, Y = get_batch('val') # fetch the very first batch
-t0 = time.time()
-for _ in range(40):
-    with ctx:
-        logits, loss = model(X, Y)
-    X, Y = get_batch('val')
+with torch.no_grad():
+    model.eval()
+    X, Y = get_batch('val') # fetch the very first batch
+    t0 = time.time()
+    for _ in range(40):
+        with ctx:
+            logits, loss = model(X, Y)
+        X, Y = get_batch('val')
 
-    # timing and logging
-    t1 = time.time()
-    dt = t1 - t0
-    inference_time_data.append(dt)
-    t0 = t1
+        # timing and logging
+        t1 = time.time()
+        dt = t1 - t0
+        inference_time_data.append(dt)
+        t0 = t1
+    model.train()
 
 ### Print profiling data
 if master_process:
