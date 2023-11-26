@@ -334,45 +334,109 @@ class PruneableGPT(GPT):
     def __init__(self, config):
         super().__init__(config)
 
+        # keep track of non-pruned size of each parameter
         self._sizes = {}
+
+        # num of global non-pruned weights
+        self._numel = 0
+
+        # mapping parameter name <> unique id
+        self._param2id = {}
+        self._id2param = {}
+
+        id_ = 0
+
         for name, param in self.named_parameters():
             if 'weight' not in name:
                 continue
             self.register_buffer(f'_{name.replace(".", "_")}_prune_mask', torch.ones_like(param, dtype=bool))
             self._sizes[name] = torch.numel(param)
-        
-        self._num_pruned = 0
 
+            self._numel += self._sizes[name]
+
+            self._param2id[name] = id_
+            self._id2param[id_] = name
+
+            id_ += 1
+        
+        self._id_range = id_
+
+        # for debugging/logging
+        self._fixed_rate = None
+        self._num_pruned = 0
         self._is_first_forward = True
         self._num_nonzero = 0
 
     @torch.no_grad()
-    def prune(self, rate):
+    def prune(self, rate, debug=False):
         self._num_pruned += 1
         self._is_first_forward = True
-        print(f'pruning model to {((1 - rate) ** self._num_pruned):.2f}x of original size')
+        print(f'\npruning model to {((1 - rate) ** self._num_pruned):.2f}x of original size')
+
+        if self._num_pruned == 1:
+            self._fixed_rate = rate
+        
+        assert self._fixed_rate == rate, f'must apply the same rate of {self._fixed_rate:.2f} for all pruning steps'
+
+        # prune top-k globally
+        k = int(self._numel * rate)
+        print(f'    => num parameters: {self._numel}, num to prune: {k}, remaining: {self._numel - k}\n')
+
+        # keep running top-k information
+        cur_topk_vals, cur_topk_inds, cur_topk_params = torch.Tensor(), torch.Tensor().to(int), torch.Tensor().to(int)
 
         for name, param in self.named_parameters():
             if 'weight' not in name:
                 continue
 
-            size = self._sizes[name]
-            num_to_prune = int(size * rate)
-            
+            cur_topk_vals = cur_topk_vals.to(param.device)
+            cur_topk_inds = cur_topk_inds.to(param.device)
+            cur_topk_params = cur_topk_params.to(param.device)
+
             mask_name = f'_{name.replace(".", "_")}_prune_mask'
             mask = getattr(self, mask_name)
 
-            # already removed values should not be contribute to topk
-            tmp = torch.clone(param)
-            tmp[~mask] = float('inf')
+            # already removed values should not contribute to top-k
+            param[~mask] = float('inf')
 
-            # find k smallest L1 and update mask
-            topk = torch.topk(torch.abs(tmp.view(-1)), k=num_to_prune, largest=False)
-            mask.view(-1)[topk.indices] = 0
+            # topk(running, topk(cur)) = topk(running + cur), right..?
+            size = self._sizes[name]
+            topk = torch.topk(torch.abs(param.view(-1)), k=min(size, k), largest=False)
 
-            del tmp
+            tmp_vals = torch.concat((cur_topk_vals, topk.values))
+            tmp_inds = torch.concat((cur_topk_inds, topk.indices))
+            tmp_params = torch.concat((cur_topk_params, torch.full(topk.values.size(), self._param2id[name], dtype=torch.int, device=param.device)))
+
+            cur_topk = torch.topk(torch.abs(tmp_vals), k=min(torch.numel(tmp_vals), k), largest=False)
             
-            self._sizes[name] -= num_to_prune
+            cur_topk_vals = cur_topk.values
+            cur_topk_inds = tmp_inds[cur_topk.indices]
+            cur_topk_params = tmp_params[cur_topk.indices]
+
+            param[~mask] = 0
+
+        assert torch.numel(cur_topk_inds) == k
+        
+        for i in range(self._id_range):
+            m = cur_topk_params == i
+            n = torch.count_nonzero(m).item()
+            if n == 0:
+                continue
+
+            if debug:
+                self._id2param[i]
+
+            ind = cur_topk_inds[m]
+            param = self._id2param[i]
+
+            if debug:
+                print(f'    => removing {n} elements from {param}')
+
+            mask = getattr(self, f'_{param.replace(".", "_")}_prune_mask')
+            mask.view(-1)[ind] = 0
+            self._sizes[param] -= n
+        
+        self._numel -= k
 
     def forward(self, idx, targets=None):
         with torch.no_grad():
@@ -386,7 +450,7 @@ class PruneableGPT(GPT):
                     self._num_nonzero += torch.count_nonzero(param)
         
         if self._is_first_forward:
-            print(f'    number of nonzero weights: {self._num_nonzero}')
+            print(f'number of non-pruned weights: {self._num_nonzero}')
         self._is_first_forward = False
 
         return super().forward(idx, targets)
