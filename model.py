@@ -331,8 +331,10 @@ class GPT(nn.Module):
         return idx
 
 class PruneableGPT(GPT):
-    def __init__(self, config):
+    def __init__(self, config, l2=False):
         super().__init__(config)
+
+        self._l2 = l2
 
         # keep track of non-pruned size of each parameter
         self._sizes = {}
@@ -350,7 +352,14 @@ class PruneableGPT(GPT):
             if 'weight' not in name:
                 continue
             self.register_buffer(f'_{name.replace(".", "_")}_prune_mask', torch.ones_like(param, dtype=bool))
+
+            assert param.dim() == 2, f'expected 2D weight tensors, got {param.dim()}D tensor'
+
             self._sizes[name] = torch.numel(param)
+
+            if self._l2:
+                # if l2 structured pruning, each row is a vector element
+                self._sizes[name] = param.size(0)
 
             self._numel += self._sizes[name]
 
@@ -401,7 +410,13 @@ class PruneableGPT(GPT):
 
             # topk(running, topk(cur)) = topk(running + cur), right..?
             size = self._sizes[name]
-            topk = torch.topk(torch.abs(param.view(-1)), k=min(size, k), largest=False)
+
+            data = torch.abs(param.view(-1))
+            if self._l2:
+                # top-k index is now row index
+                data = torch.norm(param, dim=1)
+            
+            topk = torch.topk(data, k=min(size, k), largest=False)
 
             tmp_vals = torch.concat((cur_topk_vals, topk.values))
             tmp_inds = torch.concat((cur_topk_inds, topk.indices))
@@ -423,9 +438,6 @@ class PruneableGPT(GPT):
             if n == 0:
                 continue
 
-            if debug:
-                self._id2param[i]
-
             ind = cur_topk_inds[m]
             param = self._id2param[i]
 
@@ -433,10 +445,19 @@ class PruneableGPT(GPT):
                 print(f'    => removing {n} elements from {param}')
 
             mask = getattr(self, f'_{param.replace(".", "_")}_prune_mask')
-            mask.view(-1)[ind] = 0
+
+            if self._l2:
+                mask[ind] = 0
+            else:
+                mask.view(-1)[ind] = 0
+
             self._sizes[param] -= n
         
         self._numel -= k
+    
+    def get_pruning_metadata(self):
+        rate = self._fixed_rate or 0
+        return {'non_zero': self._numel, 'pct_orig': (1 - rate) ** self._num_pruned}
 
     def forward(self, idx, targets=None):
         with torch.no_grad():
@@ -447,10 +468,13 @@ class PruneableGPT(GPT):
                     continue
                 param.data *= getattr(self, f'_{name.replace(".", "_")}_prune_mask')
                 if self._is_first_forward:
-                    self._num_nonzero += torch.count_nonzero(param)
+                    nonzero = torch.count_nonzero(param)
+                    if self._l2:
+                        nonzero /= param.size(1)
+                    self._num_nonzero += nonzero
         
         if self._is_first_forward:
-            print(f'number of non-pruned weights: {self._num_nonzero}')
+            print(f'number of non-pruned weights ({"L1" if not self._l2 else "L2"}): {self._num_nonzero}')
         self._is_first_forward = False
 
         return super().forward(idx, targets)

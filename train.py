@@ -84,6 +84,10 @@ model_cls = GPT if not prunable else PruneableGPT
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if prunable:
+    assert not ddp, "pruning does not support DDP"
+    assert init_from.startswith('gpt2'), "pruning only works with pretrained model"
+
 if ddp:
     init_process_group(backend=backend)
     ddp_rank = int(os.environ['RANK'])
@@ -291,7 +295,11 @@ while True:
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, f'{(1 - prune_rate) ** prune_iter}_ckpt.pt'))
+                ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+                if prunable:
+                    ckpt_path = os.path.join(out_dir, f'{(1 - prune_rate) ** prune_iter:.2f}x_orig_ckpt.pt')
+                    checkpoint.update(model.get_pruning_metadata())
+                torch.save(checkpoint, ckpt_path)
     if iter_num == 0 and eval_only:
         break
 
@@ -346,6 +354,9 @@ while True:
 
         iter_num = 0
         local_iter_num = 0
+
+        # reset val loss for this pruning iteration
+        best_val_loss = 1e9
 
 if ddp:
     destroy_process_group()
