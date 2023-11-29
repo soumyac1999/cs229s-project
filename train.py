@@ -260,9 +260,12 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 
-prune_max_iter = 10
+prune_max_iter = 20
 prune_rate = 1 - 0.1 ** (1 / prune_max_iter)  # reach 10% of model in 5 iterations
 prune_iter = 0
+
+if prunable:
+    print(f'Pruning Configurations: pruning at {prune_rate:.2f} for {prune_max_iter} iterations')
 
 while True:
 

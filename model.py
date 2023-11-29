@@ -353,7 +353,7 @@ class PruneableGPT(GPT):
                 continue
             self.register_buffer(f'_{name.replace(".", "_")}_prune_mask', torch.ones_like(param, dtype=bool))
 
-            assert param.dim() == 2, f'expected 2D weight tensors, got {param.dim()}D tensor'
+            assert 1 <= param.dim() <= 2, f'expected 1~2D weight tensors, got {param.dim()}D tensor'
 
             self._sizes[name] = torch.numel(param)
 
