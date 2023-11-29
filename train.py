@@ -263,7 +263,8 @@ train_time_data = []
 inference_time_data = []
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+if not eval_only:
+    X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 # TODO: check if this unwrapping is needed with FSDP
@@ -373,8 +374,14 @@ with torch.no_grad():
 
 ### Print profiling data
 if master_process:
-    print("Average train time per iteration: ", np.mean(train_time_data[20:40]))
-    print("Average inference time per iteration: ", np.mean(inference_time_data[20:40]))
+    loss = lossf if not eval_only else float('nan')
+    train_throughput = 20*batch_size*block_size*gradient_accumulation_steps/np.sum(train_time_data[20:40])
+    inference_latency = np.mean(inference_time_data[20:40])
+
+    print('SENTINEL', loss, train_throughput, inference_latency)
+
+    # print("Average train time per iteration: ", np.mean(train_time_data[20:40]))
+    # print("Average inference throughput per iteration: ", np.mean(batch_size*block_size/np.array(inference_time_data[20:40])))
 
 if mult_gpus:
     barrier()

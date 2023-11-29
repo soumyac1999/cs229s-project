@@ -1,0 +1,7 @@
+data/*  
+examples/*  
+out/*  
+shakespeare/*  
+wandb/*  
+wikitext/*  
+.git/*
