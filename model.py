@@ -14,6 +14,41 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.nn.parallel import parallel_apply, comm
+from torch.nn.parallel._functions import Broadcast
+
+
+class f(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, devices, out_device=None):
+        if out_device is None:
+            out_device = devices[0]
+
+        ctx.devices = devices
+        ctx.out_device = out_device 
+        x = Broadcast.apply(devices, x)
+        return x
+
+    @staticmethod
+    def backward(ctx, gradient):
+        gradient = comm.reduce_add(gradient, ctx.out_device)
+        return gradient
+    
+class g(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, devices, out_device=None):
+        if out_device is None:
+            out_device = devices[0]
+
+        ctx.devices = devices
+        ctx.out_device = out_device
+        x = comm.reduce_add(x, ctx.out_device)
+        return x
+    
+    @staticmethod
+    def backward(ctx, gradient):
+        gradient = Broadcast.apply(ctx.devices, gradient)
+        return gradient
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -91,14 +126,50 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+
+class TensorParallelMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        # HACK: does not work with bias (yet?)
+        assert not config.bias, 'set bias to False'
+        self.devices = config.get('devices', [])
+        
+        if len(self.devices) != config.num_shards:
+            self.devices = [torch.device(f'cuda:{i}') for i in range(len(config.num_shards))]
+        
+        self.c_fc_shards = nn.ModuleList()
+        self.gelu_shards = nn.ModuleList([nn.GELU() for _ in range(config.num_shards)])
+        self.c_proj_shards = nn.ModuleList()
+        self.dropout = nn.Dropout(config.dropout)
+
+        split_dim = 4 * config.n_embd // config.num_shards
+
+        for i in range(config.num_shards):
+            self.c_fc_shards.append(nn.Linear(config.n_embd, split_dim, bias=config.bias), device=self.devices[i])
+            self.c_proj_shards.append(nn.Linear(split_dim, config.n_embd, bias=config.bias), device=self.devices[i])
+
+    def forward(self, x):
+        x = f.apply(x, self.devices)
+        x = parallel_apply(self.c_fc_shards, x, None, self.devices)
+        x = parallel_apply(self.gelu_shards, x, None, self.devices)
+        x = parallel_apply(self.c_proj_shards, x, None, self.devices)
+        x = g.apply(x, self.devices)
+        x = self.dropout(x)
+        return x
+        
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+
+        use_tp = config.get('use_tp', False)
+        
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        # TODO: implement tp attention
+        self.attn = CausalSelfAttention(config) if not use_tp else CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config) if not use_tp else TensorParallelMLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
