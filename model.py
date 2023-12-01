@@ -110,6 +110,93 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+class ManualAttention(nn.Module):
+    def __init__(self, config, dropout):
+        super().__init__()
+        self.dropout = dropout
+        # self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        # if not self.flash:
+        print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        # TODO: seems like there is no need to transfer buffers explicitly between device? Not too sure
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                    .view(1, 1, config.block_size, config.block_size))
+    
+    def forward(self, q, k, v):
+        B, T, hs = q.size()
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.dropout(att)
+        y = att @ v
+        return y
+        # y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+class TensorParallelAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_attn_shards = nn.ModuleList()
+
+        self.k_shards = nn.ModuleList()
+        self.q_shards = nn.ModuleList()
+        self.v_shards = nn.ModuleList()
+
+        self.attn_shards = nn.ModuleList()
+
+        self.c_proj_shards = nn.ModuleList()
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+
+        num_shards = config.get('num_shards', self.n_head)
+        assert num_shards == self.n_head
+
+        self.devices = config.get('devices', [])
+        if len(self.devices) != num_shards:
+            self.devices = [torch.device(f'cuda:{i}') for i in range(len(num_shards))]
+        
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        # self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        # if not self.flash:
+        #     print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+        #     # causal mask to ensure that attention is only applied to the left in the input sequence
+        #     # TODO: seems like there is no need to transfer buffers explicitly between device? Not too sure
+        #     self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+        #                                 .view(1, 1, config.block_size, config.block_size))
+
+        num_shards = config.num_shards
+        # attn_split_dim = 3 * config.n_embd // num_shards
+        attn_split_dim = config.n_embd // num_shards
+        proj_split_dim = config.n_embd // num_shards
+
+        for i in range(num_shards):
+            self.k_shards.append(nn.Linear(config.n_embd, attn_split_dim, bias=config.bias, device=self.devices[i]))
+            self.q_shards.append(nn.Linear(config.n_embd, attn_split_dim, bias=config.bias, device=self.devices[i]))
+            self.v_shards.append(nn.Linear(config.n_embd, attn_split_dim, bias=config.bias, device=self.devices[i]))
+
+            # TODO: not sure if this is the best way to go about it
+            # multiple masks
+            self.attn_shards.append(ManualAttention(config, dropout=nn.Dropout(config.dropout)))
+            self.c_proj_shards.append(nn.Linear(proj_split_dim, config.n_embd, bias=config.bias, device=self.devices[i]))
+
+    
+    def forward(self, x):
+        x = f.apply(x, self.devices)
+        # each ks, qs, vs is [(B, T, hs)] * nh
+        ks = parallel_apply(self.k_shards, x, None, self.devices)
+        qs = parallel_apply(self.q_shards, x, None, self.devices)
+        vs = parallel_apply(self.v_shards, x, None, self.devices)
+
+        inputs = []
+        for i in range(len(ks)):
+            inputs.append((ks[i], qs[i], vs[i]))
+
+        ys = parallel_apply(self.attn_shards, inputs, None, self.devices)
+        out = parallel_apply(self.c_proj_shards, ys, None, self.devices)
+        z = g.apply(out, self.devices)
+        z = self.resid_dropout(z)
+        return z
+        
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -167,7 +254,7 @@ class Block(nn.Module):
         
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         # TODO: implement tp attention
-        self.attn = CausalSelfAttention(config) if not use_tp else CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config) if not use_tp else TensorParallelAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config) if not use_tp else TensorParallelMLP(config)
 
