@@ -69,7 +69,7 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = 'cuda:6' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
@@ -80,6 +80,11 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 
 # TODO: prune configs
 prunable = True
+loss_guided_pruning = True 
+
+if loss_guided_pruning:
+    assert prunable
+
 model_cls = GPT if not prunable else PruneableGPT
 
 # various inits, derived attributes, I/O setup
@@ -264,8 +269,16 @@ prune_max_iter = 20
 prune_rate = 1 - 0.1 ** (1 / prune_max_iter)  # reach 10% of model in 5 iterations
 prune_iter = 0
 
+if loss_guided_pruning:
+    tol = 0.2
+    loss_thres = 3.2 - tol
+    micro_prune_iter = 10
+    micro_prune_rate = prune_rate ** (1 / micro_prune_iter)
+
 if prunable:
     print(f'Pruning Configurations: pruning at {prune_rate:.2f} for {prune_max_iter} iterations')
+    if loss_guided_pruning:
+        print(f'    PART B) Loss Guided Pruning')
 
 while True:
 
@@ -352,11 +365,22 @@ while True:
         prune_iter += 1
         if not prunable or prune_iter > prune_max_iter:
             break
-        
-        model.prune(prune_rate)
 
-        iter_num = 0
-        local_iter_num = 0
+        if loss_guided_pruning:
+            for i in range(micro_prune_iter):
+                print(f'pruning model an additional {micro_prune_rate:.3f}')
+                model.prune(micro_prune_rate)
+                loss = estimate_loss()
+                if loss >= loss_thres:
+                    print(f'oop, there it is! loss of {loss:.3f}')
+                    break
+                print(f'hey, we can still prune! loss is {loss:.3f}')
+        else:
+            model.prune(prune_rate)
+        
+        # for part b, finetune for 25 iterations
+        iter_num = 0 if not loss_guided_pruning else max_iters - 25
+        local_iter_num = 0 if not loss_guided_pruning else max_iters - 25
 
         # reset val loss for this pruning iteration
         best_val_loss = 1e9
