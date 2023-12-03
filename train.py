@@ -20,6 +20,7 @@ import os
 import time
 import math
 import pickle
+import functools
 from contextlib import nullcontext
 
 import numpy as np
@@ -29,8 +30,15 @@ from torch.distributed.fsdp import (
 )
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group, barrier
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper,
+    CheckpointImpl,
+    apply_activation_checkpointing,
+)
 
-from model import GPTConfig, GPT
+
+from model import GPTConfig, GPT, Block
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -78,7 +86,6 @@ compile = False # use PyTorch 2.0 to compile the model to be faster
 
 ## NEW FLAGS
 ddp = False
-fsdp = False
 
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -201,7 +208,26 @@ if ddp or not mult_gpus:
     model.to(device)
 else:
     # TODO: need to figure out how to optimally use sharding strategy
-    model = FSDP(model, device_id=torch.cuda.current_device())
+    gpt_auto_wrap_policy = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={Block,},
+    )
+    model = FSDP(model,
+                 auto_wrap_policy=gpt_auto_wrap_policy,
+                 mixed_precision=None,
+                 sharding_strategy=torch.distributed.fsdp.ShardingStrategy.FULL_SHARD,
+                 device_id=torch.cuda.current_device(),
+                 limit_all_gathers=True)
+
+    non_reentrant_wrapper = functools.partial(
+        checkpoint_wrapper,
+        offload_to_cpu=False,
+        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+    )
+    check_fn = lambda submodule: isinstance(submodule, Block)
+    apply_activation_checkpointing(
+        model, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn
+    )
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
@@ -235,7 +261,8 @@ def estimate_loss():
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
-    barrier()
+    if mult_gpus:
+        barrier()
     model.train()
     return out
 
