@@ -2,7 +2,7 @@ import os
 import torch 
 import matplotlib.pyplot as plt
 
-ckpt_dir = 'wikitext'
+ckpt_dir = 'wikitext2'
 device = 'cpu'
 
 dirs = [os.path.join(ckpt_dir, d) for d in os.listdir(ckpt_dir)]
