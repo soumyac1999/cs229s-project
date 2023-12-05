@@ -336,7 +336,7 @@ class PruneableGPT(GPT):
 
         self._l2 = l2
         if self._l2:
-            raise NotImplemented("this doesn't work yet :)")
+            raise NotImplemented("this doessn't work yet :)")
             self._num_channels = 0
             self._shapes = {}
             self._rem_channels = {}
