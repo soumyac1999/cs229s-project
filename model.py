@@ -114,6 +114,7 @@ class ManualAttention(nn.Module):
     def __init__(self, config, dropout):
         super().__init__()
         self.dropout = dropout
+        self.n_head = config.n_head // config.num_shards
         # self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         # if not self.flash:
         print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
@@ -123,14 +124,19 @@ class ManualAttention(nn.Module):
                                     .view(1, 1, config.block_size, config.block_size))
     
     def forward(self, q, k, v):
-        B, T, hs = q.size()
+        B, T, C = q.size()
+
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         att = self.dropout(att)
         y = att @ v
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         return y
-        # y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
 class TensorParallelAttention(nn.Module):
     def __init__(self, config):
@@ -147,12 +153,10 @@ class TensorParallelAttention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
 
-        num_shards = config.get('num_shards', self.n_head)
-        assert num_shards == self.n_head
+        num_shards = config.num_shards
+        assert self.n_head % num_shards == 0
 
-        self.devices = config.get('devices', [])
-        if len(self.devices) != num_shards:
-            self.devices = [torch.device(f'cuda:{i}') for i in range(len(num_shards))]
+        self.devices = [torch.device(f'cuda:{i}') for i in range(num_shards)]
         
         self.n_embd = config.n_embd
         self.dropout = config.dropout
@@ -164,20 +168,15 @@ class TensorParallelAttention(nn.Module):
         #     self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
         #                                 .view(1, 1, config.block_size, config.block_size))
 
-        num_shards = config.num_shards
-        # attn_split_dim = 3 * config.n_embd // num_shards
         attn_split_dim = config.n_embd // num_shards
-        proj_split_dim = config.n_embd // num_shards
 
         for i in range(num_shards):
             self.k_shards.append(nn.Linear(config.n_embd, attn_split_dim, bias=config.bias, device=self.devices[i]))
             self.q_shards.append(nn.Linear(config.n_embd, attn_split_dim, bias=config.bias, device=self.devices[i]))
             self.v_shards.append(nn.Linear(config.n_embd, attn_split_dim, bias=config.bias, device=self.devices[i]))
 
-            # TODO: not sure if this is the best way to go about it
-            # multiple masks
-            self.attn_shards.append(ManualAttention(config, dropout=nn.Dropout(config.dropout)))
-            self.c_proj_shards.append(nn.Linear(proj_split_dim, config.n_embd, bias=config.bias, device=self.devices[i]))
+            self.attn_shards.append(ManualAttention(config, dropout=nn.Dropout(config.dropout)).to(self.devices[i]))
+            self.c_proj_shards.append(nn.Linear(config.n_embd // num_shards, config.n_embd, bias=config.bias, device=self.devices[i]))
 
     
     def forward(self, x):
@@ -220,10 +219,8 @@ class TensorParallelMLP(nn.Module):
 
         # HACK: does not work with bias (yet?)
         assert not config.bias, 'set bias to False'
-        self.devices = config.get('devices', [])
-        
-        if len(self.devices) != config.num_shards:
-            self.devices = [torch.device(f'cuda:{i}') for i in range(len(config.num_shards))]
+
+        self.devices = [torch.device(f'cuda:{i}') for i in range(config.num_shards)]
         
         self.c_fc_shards = nn.ModuleList()
         self.gelu_shards = nn.ModuleList([nn.GELU() for _ in range(config.num_shards)])
@@ -233,8 +230,8 @@ class TensorParallelMLP(nn.Module):
         split_dim = 4 * config.n_embd // config.num_shards
 
         for i in range(config.num_shards):
-            self.c_fc_shards.append(nn.Linear(config.n_embd, split_dim, bias=config.bias), device=self.devices[i])
-            self.c_proj_shards.append(nn.Linear(split_dim, config.n_embd, bias=config.bias), device=self.devices[i])
+            self.c_fc_shards.append(nn.Linear(config.n_embd, split_dim, bias=config.bias, device=self.devices[i]))
+            self.c_proj_shards.append(nn.Linear(split_dim, config.n_embd, bias=config.bias, device=self.devices[i]))
 
     def forward(self, x):
         x = f.apply(x, self.devices)
@@ -245,18 +242,30 @@ class TensorParallelMLP(nn.Module):
         x = self.dropout(x)
         return x
         
+class TensorParallelBlock(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias).to('cuda:0')
+        self.attn = TensorParallelAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias).to('cuda:0')
+        self.mlp = TensorParallelMLP(config)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
 
-        use_tp = config.get('use_tp', False)
-        
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        # TODO: implement tp attention
-        self.attn = CausalSelfAttention(config) if not use_tp else TensorParallelAttention(config)
+        self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config) if not use_tp else TensorParallelMLP(config)
+        self.mlp = MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
@@ -272,6 +281,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    use_tp: bool = True
+    num_shards: int = 4
 
 class GPT(nn.Module):
 
@@ -281,14 +292,16 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
+        block = Block if not self.config.use_tp else TensorParallelBlock
+
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wte = nn.Embedding(config.vocab_size, config.n_embd, device='cuda:0'),
+            wpe = nn.Embedding(config.block_size, config.n_embd, device='cuda:0'),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            h = nn.ModuleList([block(config) for _ in range(config.n_layer)]),
+            ln_f = LayerNorm(config.n_embd, bias=config.bias).to('cuda:0'),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False, device='cuda:0')
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"

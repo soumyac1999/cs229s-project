@@ -197,12 +197,6 @@ if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 
-if ddp or not mult_gpus:
-    model.to(device)
-else:
-    # TODO: need to figure out how to optimally use sharding strategy
-    model = FSDP(model, device_id=torch.cuda.current_device())
-
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
@@ -235,7 +229,6 @@ def estimate_loss():
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
-    barrier()
     model.train()
     return out
 
