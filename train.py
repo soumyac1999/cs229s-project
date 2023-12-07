@@ -382,6 +382,9 @@ while True:
     if iter_num > max_iters:
         break
 
+if master_process:
+    memory_usage = ','.join([str(torch.cuda.max_memory_allocated(i)/1e9) for i in range(world_size)])
+
 # inference loop
 with torch.no_grad():
     model.eval()
@@ -405,7 +408,7 @@ if master_process:
     train_throughput = 20*batch_size*block_size*gradient_accumulation_steps/np.sum(train_time_data[20:40])
     inference_latency = np.mean(inference_time_data[20:40])
 
-    print('SENTINEL', loss, train_throughput, inference_latency)
+    print('SENTINEL', loss, train_throughput, inference_latency, memory_usage)
 
     # print("Average train time per iteration: ", np.mean(train_time_data[20:40]))
     # print("Average inference throughput per iteration: ", np.mean(batch_size*block_size/np.array(inference_time_data[20:40])))
