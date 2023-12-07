@@ -4,11 +4,11 @@ import matplotlib.pyplot as plt
 
 def plot(results):
     batch_sizes = list(results.keys())
-    throughput_values = [result[0] for result in results.values()]
+    throughput_values = [float(result[0]) for result in results.values()]
     memory_usage_strings = [result[1] for result in results.values()]
 
     # Convert memory usage strings to lists of floats
-    memory_usage_values = [list(map(float, mem.split(', '))) for mem in memory_usage_strings]
+    memory_usage_values = [list(map(float, mem.split(','))) for mem in memory_usage_strings]
 
     # Plot Training Throughput
     plt.figure(figsize=(12, 6))
@@ -42,8 +42,7 @@ while True:
     out = Popen(
         f"python train.py config/train_wikitext.py {config}", 
         shell=True, stdout=PIPE, text=True).stdout.read()
-    sentinel, _, training_throughput, _, mem_usage = out.decode(
-        "utf-8").split("\n")[-2].split(" ")
+    sentinel, _, training_throughput, _, mem_usage = out.split("\n")[-2].split(" ")
     assert sentinel == "SENTINEL"
     print(bs, training_throughput, mem_usage)
     results[bs] = (training_throughput, mem_usage)

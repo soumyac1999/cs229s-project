@@ -349,7 +349,7 @@ while True:
         break
 
 if master_process:
-    memory_usage = ', '.join([str(torch.cuda.max_memory_allocated(i)/1e9) for i in range(gptconf.num_shards)])
+    memory_usage = ','.join([str(torch.cuda.max_memory_allocated(i)/1e9) for i in range(gptconf.num_shards)])
 
 # inference loop
 with torch.no_grad():
