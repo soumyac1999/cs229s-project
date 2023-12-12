@@ -1,8 +1,6 @@
-from subprocess import Popen, PIPE
-import numpy as np
 import matplotlib.pyplot as plt
 
-
+# Given function
 def plot(results):
     batch_sizes = list(results.keys())
     throughput_values = [float(result[0]) for result in results.values()]
@@ -30,22 +28,18 @@ def plot(results):
     plt.legend()
 
     plt.tight_layout()
-    plt.savefig('fsdp_plot.pdf', dpi=300)
+    plt.savefig('tp_plot.pdf', dpi=300)
 
 
-results = {}
+# Values to feed into the function
+results_dict = {
+    4: ['1184.1638932804074', '2.158878208,0.0,0.0,0.0'],
+    8: ['2382.961254541504', '2.518595072,0.0,0.0,0.0'],
+    16: ['4612.84249293933', '3.2431488,0.0,0.0,0.0'],
+    32: ['8538.482316600135', '4.695229952,0.0,0.0,0.0'],
+    64: ['13692.174117921739', '7.591845376,0.0,0.0,0.0']
+}
 
-bs = 4
-while True:
-    config = (f"--max_iters=40 --batch_size={bs} --block_size=128 "
-              "--gradient_accumulation_steps=40 --eval_iters=1")
-    out = Popen(
-        f"torchrun --nproc_per_node=4 train.py config/train_wikitext.py {config}", 
-        shell=True, stdout=PIPE, text=True).stdout.read()
-    sentinel, _, training_throughput, _, mem_usage = out.split("\n")[-2].split(" ")
-    assert sentinel == "SENTINEL"
-    print(bs, training_throughput, mem_usage)
-    results[bs] = (training_throughput, mem_usage)
-    plot(results)
+# Call the plot function
+plot(results_dict)
 
-    bs *= 2
