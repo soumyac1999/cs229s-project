@@ -309,7 +309,7 @@ while True:
     if iter_num % eval_interval == 0:
         losses = estimate_loss()
         if master_process:
-            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']}")
             if wandb_log:
                 wandb.log({
                     "iter": iter_num,
@@ -385,23 +385,24 @@ while True:
 if master_process:
     memory_usage = ','.join([str(torch.cuda.max_memory_allocated(i)/1e9) for i in range(world_size)])
 
-# inference loop
-with torch.no_grad():
-    model.eval()
-    X, Y = get_batch('val') # fetch the very first batch
-    t0 = time.time()
-    for _ in range(40):
-        with ctx:
-            logits, loss = model(X, Y)
-        X, Y = get_batch('val')
-
-        # timing and logging
-        t1 = time.time()
-        dt = t1 - t0
-        inference_time_data.append(dt)
-        t0 = t1
-    model.train()
-
+if eval_only:
+    # inference loop
+    with torch.no_grad():
+        model.eval()
+        X, Y = get_batch('val') # fetch the very first batch
+        t0 = time.time()
+        for _ in range(40):
+            with ctx:
+                logits, loss = model(X, Y)
+            X, Y = get_batch('val')
+    
+            # timing and logging
+            t1 = time.time()
+            dt = t1 - t0
+            inference_time_data.append(dt)
+            t0 = t1
+        model.train()
+    
 ### Print profiling data
 if master_process:
     loss = lossf if not eval_only else float('nan')
