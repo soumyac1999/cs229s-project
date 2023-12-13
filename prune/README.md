@@ -1,9 +1,9 @@
 
-# Pruning (Part 3)
+# Pruning (Part 2)
 ## Run the following commands
 
 ### L1 Unstructured, Part A
-```
+```bash
 $ python train.py \
     config/train_wikitext.py \
     --max_iters=100 \
@@ -12,7 +12,7 @@ $ python train.py \
     --prune_max_iters=30
 ```
 ### L1 Unstructured, Part B
-```
+```bash
 $ python train.py \
     config/train_wikitext.py \
     --max_iters=50 \
@@ -22,7 +22,7 @@ $ python train.py \
     --loss_guided_prune=True
 ```
 ### L2 Structured, Part A
-```
+```bash
 $ python train.py \
     config/train_wikitext.py \
     --max_iters=100 \
@@ -32,7 +32,7 @@ $ python train.py \
     --loss_guided_prune=True
 ```
 ### L1 Unstructured, Part B
-```
+```bash
 $ python train.py \
     config/train_wikitext.py \
     --max_iters=50 \
