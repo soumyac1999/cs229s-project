@@ -15,7 +15,7 @@ config = "--max_iters=0 --batch_size=1 --block_size=1024 --eval_only=True"
 out = Popen(
     f"torchrun --nproc_per_node=4 train.py config/train_wikitext.py {config}", 
     shell=True, stdout=PIPE).stdout.read()
-sentinel, _, _, inference_latency_1, _ = out.decode(
+sentinel, _, _, inference_latency_1, mem_usage = out.decode(
     "utf-8").split("\n")[-2].split(" ")
 assert sentinel == "SENTINEL"
 
@@ -54,6 +54,7 @@ with open('results.json', 'w') as f:
         "inference_latency_1": inference_latency_1,
         "inference_latency_12": inference_latency_12,
         "training_throughput_4": training_throughput_4,
-        "training_throughput_12": training_throughput_12
+        "training_throughput_12": training_throughput_12,
+        "memory_usage": float(mem_usage.split(",")[0])*1e9
     }
     json.dump(result, f)

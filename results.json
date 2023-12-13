@@ -1,1 +1,1 @@
-{"loss": 2.836885452270508, "inference_latency_1": "0.11084583997726441", "inference_latency_12": "0.21152738332748414", "training_throughput_4": "9439.293630851036", "training_throughput_12": "14054.41861933085"}
+{"loss": 2.836885452270508, "inference_latency_1": "0.11084583997726441", "inference_latency_12": "0.21152738332748414", "training_throughput_4": "9439.293630851036", "training_throughput_12": "14054.41861933085", "memory_usage": 1100638720.0}

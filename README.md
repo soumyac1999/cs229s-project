@@ -1,3 +1,48 @@
+# CS 229S Project
+> Aditya Agrawal, Soumya Chatterjee, Simon Kim
+
+This folder contains our submission scripts for the leaderboard which uses FSDP with our leaderboard optimizations including activation checkpointing.
+
+The directory structure is as follows:
+
+```
+cs229s-project/
+├── prune
+│   ├── model.py
+│   ├── train.py
+├── tensor_model_parallel
+│   ├── model.py
+│   ├── plot_runs.py
+│   ├── train.py
+├── model.py
+├── README.md
+├── results.json
+├── run_experiments.py
+├── train.py
+└── writeup.pdf
+```
+
+The scripts for FSDP are in this directory. For parts beyond the leaderboard and FSDP, i.e. tensor model parallelism and pruning, please check their respective directories `tensor_model_parallel` and `prune`. The instructions for running the experiments are given in the respective README files within these directories.
+
+# Fully Sharded Data Parallel (Part 1a)
+
+## Run the following commands
+
+To do a training run using FSDP with a batch size of 4, run:
+```bash
+torchrun --nproc_per_node=4 train.py config/train_wikitext.py \
+    --max_iters=40 --batch_size=4 --block_size=1024 \
+    --gradient_accumulation_steps=40
+```
+
+To get the `results.json` file for the leaderboard, run
+```bash
+python run_experiments.py
+```
+
+---
+Original README below:
+---
 
 # nanoGPT
 
