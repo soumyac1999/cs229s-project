@@ -27,7 +27,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+from model import GPTConfig, GPT, PruneableGPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -69,10 +69,22 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = 'cuda:6' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
+
+# PRUNINNG CONFIGURATIONS -----------------------------------------------------
+loss_guided_prune = False 
+loss_guided_tol = 0.05
+loss_guided_upper = 3.2
+
+prune_l1 = False 
+prune_l2 = False 
+
+prune_max_iters = 20
+# -----------------------------------------------------------------------------
+
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
@@ -80,6 +92,21 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+
+pretrained_model_cls = GPT
+
+pruneable = True if loss_guided_prune or prune_l1 or prune_l2 else False 
+if pruneable:
+    assert not prune_l1 or not prune_l2, "Cannot set both L1 Pruning and L2 Pruning"
+    assert not ddp, "pruning does not support DDP"
+    assert init_from.startswith('gpt2'), "pruning only works with pretrained model"
+
+    if not prune_l1 and not prune_l2: prune_l1 = True
+    pretrained_model_cls = PruneableGPT
+
+    prune_rate = 1 - 0.1 ** (1 / prune_max_iters)
+    prune_iter = 0
+
 if ddp:
     init_process_group(backend=backend)
     ddp_rank = int(os.environ['RANK'])
@@ -179,7 +206,10 @@ elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
     override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
+    # model = GPT.from_pretrained(init_from, override_args)
+    if pruneable:
+        override_args['prune_l2'] = prune_l2
+    model = pretrained_model_cls.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
@@ -249,6 +279,36 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+
+# # reach 10% of model size in prune_max_iter pruning steps
+# # this effectively sets how aggressive we want to prune at each step
+# prune_max_iter = 20
+# prune_rate = 1 - 0.1 ** (1 / prune_max_iter)  # reach 10% of model in 5 iterations
+# prune_iter = 0
+
+if loss_guided_prune:
+    loss_thres = loss_guided_upper - loss_guided_tol
+    orig_num_params = model._numel
+    # break when model size requirement is met
+    prune_max_iters = 1e9
+
+    # prune incrementally up to prune_rate in micro_prune_iter iterations
+    # for simplicity, this is static
+    # so in this case, we train until 10% model is reached, regardless of prune_max_iter
+    # micro_prune_rate = 1 - 0.1 ** (1 / (prune_max_iter * 2))
+    # prune_max_iter = 1e9
+
+    # micro prune iter is just to set pruning aggressiveness
+    # may prune more or fewwer than iter
+    # micro_prune_iter = 10
+    # micro_prune_rate = prune_rate ** (1 / micro_prune_iter)
+
+if pruneable:
+    print(f'Model Pruning Configurations (Part {"A" if not loss_guided_prune else "B"}):\n'
+          f'    Top-k Norm: {"L1" if prune_l1 else "L2"}\n'
+          f'    Prune Rate: {prune_rate:.3f}\n'
+          f'    Prune Iterations: {prune_max_iters if not loss_guided_prune else "N/A"}')
+
 while True:
 
     # determine and set the learning rate for this iteration
@@ -280,7 +340,11 @@ while True:
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+                if pruneable:
+                    ckpt_path = os.path.join(out_dir, f'{(1 - prune_rate) ** prune_iter:.2f}x_orig_ckpt.pt')
+                    checkpoint.update(model.get_pruning_metadata())
+                torch.save(checkpoint, ckpt_path)
     if iter_num == 0 and eval_only:
         break
 
@@ -327,7 +391,43 @@ while True:
 
     # termination conditions
     if iter_num > max_iters:
-        break
+        prune_iter += 1
+        if not pruneable or prune_iter > prune_max_iters:
+            break
+
+        print(f'\n**********************PRUNING STEP {prune_iter}!!!*********************\n')
+        if loss_guided_prune:
+            i = 0
+            while True:
+                pct_original = model._numel / orig_num_params
+                if math.isclose(pct_original, 0.1) or pct_original < 0.1: 
+                    print(f'Reached {pct_original:.3f} of original model size \u2705 Exiting...')
+                    break 
+
+                loss = estimate_loss()['val']
+                if loss >= loss_thres:
+                    print(f'[iter {i}] Loss: {loss:.3f} >= {loss_guided_upper} - {loss_guided_tol}. \u274C Exiting && Resuming finetuning...')
+                    break
+                print(f'[iter {i}] Loss: {loss:.3f} < {loss_guided_upper} - {loss_guided_tol}. Pruning!')
+
+                model.prune(prune_rate)
+                i += 1
+        else:
+            model.prune(prune_rate)
+        print(f'\n********************(END) PRUNING STEP!!!********************\n')
+                
+        # for part b, finetune for 25 iterations
+        if loss_guided_prune:
+            max_iters = 25
+
+        iter_num = 0  #  if not loss_guided_prune else max_iters - 25
+        # iter_num = max(0, iter_num)
+                
+        local_iter_num = 0 # if not loss_guided_prune else max_iters - 25
+        # local_iter_num = max(0, local_iter_num)
+
+        # reset val loss for this pruning iteration
+        best_val_loss = 1e9
 
 if ddp:
     destroy_process_group()

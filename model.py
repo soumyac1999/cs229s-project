@@ -130,6 +130,7 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -328,3 +329,293 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+class PruneableGPT(GPT):
+    def __init__(self, config, l2=False):
+        super().__init__(config)
+
+        self._l2 = l2
+        if self._l2:
+            raise NotImplemented("this doessn't work yet :)")
+            self._num_channels = 0
+            self._shapes = {}
+            self._rem_channels = {}
+
+        # keep track of non-pruned size of each parameter
+        self._sizes = {}
+
+        # num of global non-pruned weights
+        self._numel = 0
+
+        # mapping parameter name <> unique id
+        self._param2id = {}
+        self._id2param = {}
+
+        id_ = 0
+
+        for name, param in self.named_parameters():
+            if 'weight' not in name:
+                continue
+            
+            if not self._l2:
+                self.register_buffer(f'_{name.replace(".", "_")}_prune_mask', torch.ones_like(param, dtype=bool))
+            else:
+                assert param.dim() < 3
+                if param.dim() == 2:
+                    self._num_channels += param.size(0)
+                    self._shapes[name] = param.size()
+
+            # assert 1 <= param.dim() <= 2, f'expected 1~2D weight tensors, got {param.dim()}D tensor'
+
+            self._sizes[name] = torch.numel(param)
+
+            # if self._l2:
+            #     # if l2 structured pruning, each row is a vector element
+            #     self._sizes[name] = param.size(0) if param.dim() == 2 else 1
+
+            self._numel += self._sizes[name]
+
+            self._param2id[name] = id_
+            self._id2param[id_] = name
+
+            id_ += 1
+        
+        self._id_range = id_
+
+        # for debugging/logging
+        self._fixed_rate = None
+        self._num_pruned = 0
+        self._is_first_forward = True
+        self._num_nonzero = 0
+    
+    @torch.no_grad()
+    def prune_l2(self, rate, debug=False):
+        assert self._l2, "init module with l2=True to use L2 Pruning"        
+
+        # prune top-k channels
+        kc = int(self._num_channels * rate)
+
+        # cur_topk_vals: running top-k L2 norms across dim 1
+        # cur_topk_inds: running top-k row indices corresponding to vals
+        # cur_topk_params: running top-k param uids corresponding to vals
+        cur_topk_vals, cur_topk_inds, cur_topk_params = torch.Tensor(), torch.Tensor().to(int), torch.Tensor().to(int)
+        
+        for name, param in self.named_parameters():
+            if 'weight' not in name or param.dim() < 2:
+                continue
+
+            cur_topk_vals = cur_topk_vals.to(param.device)
+            cur_topk_inds = cur_topk_inds.to(param.device)
+            cur_topk_params = cur_topk_params.to(param.device)
+
+            nc = param.size(0)
+            data = torch.norm(param, dim=1)
+            
+            topk = torch.topk(data, k=min(nc, kc), largest=False)
+
+            tmp_vals = torch.concat((cur_topk_vals, topk.values))
+            tmp_inds = torch.concat((cur_topk_inds, topk.indices))
+            tmp_params = torch.concat((cur_topk_params, torch.full(topk.values.size(), self._param2id[name], dtype=torch.int, device=param.device)))
+
+            cur_topk = torch.topk(torch.abs(tmp_vals), k=min(torch.numel(tmp_vals), kc), largest=False)
+            
+            cur_topk_vals = cur_topk.values
+            cur_topk_inds = tmp_inds[cur_topk.indices]
+            cur_topk_params = tmp_params[cur_topk.indices]
+
+
+        assert torch.numel(cur_topk_inds) == kc
+
+        for i in range(self._id_range):
+            m = cur_topk_params == i
+            n = torch.count_nonzero(m).item()
+            if n == 0:
+                continue
+            
+            # row indices in current param to prune out
+            ind = cur_topk_inds[m]
+            
+            param = self._id2param[i]
+            param_shape = self._shapes[param]
+
+            mask = torch.ones(param_shape[0], dtype=torch.bool)
+            mask[ind] = False 
+
+            self._rem_channels[param] = mask
+
+            if debug:
+                print(f'    => removing {n} channels from {param}, (orig_shape: {param_shape})')
+        
+        self._num_channels -= kc
+
+
+    @torch.no_grad()
+    def prune(self, rate, debug=False):
+        self._num_pruned += 1
+        self._is_first_forward = True
+        print(f'\npruning model to {((1 - rate) ** self._num_pruned):.3f}x of original size')
+
+        if self._num_pruned == 1:
+            self._fixed_rate = rate
+        
+        assert self._fixed_rate == rate, f'must apply the same rate of {self._fixed_rate:.2f} for all pruning steps'
+
+        # prune top-k globally
+        k = int(self._numel * rate)
+        print(f'    => num parameters: {self._numel}, num to prune: {k}, remaining: {self._numel - k}\n')
+
+        # keep running top-k information
+        cur_topk_vals, cur_topk_inds, cur_topk_params = torch.Tensor(), torch.Tensor().to(int), torch.Tensor().to(int)
+
+        for name, param in self.named_parameters():
+            if 'weight' not in name:
+                continue
+
+            cur_topk_vals = cur_topk_vals.to(param.device)
+            cur_topk_inds = cur_topk_inds.to(param.device)
+            cur_topk_params = cur_topk_params.to(param.device)
+
+            mask_name = f'_{name.replace(".", "_")}_prune_mask'
+            mask = getattr(self, mask_name)
+
+            # already removed values should not contribute to top-k
+            param[~mask] = float('inf')
+
+            # topk(running, topk(cur)) = topk(running + cur), right..?
+            size = self._sizes[name]
+
+            data = torch.abs(param.view(-1))
+            if self._l2:
+                # top-k index is now row index
+                data = torch.norm(param, dim=param.dim() - 1)
+            
+            topk = torch.topk(data, k=min(size, k), largest=False)
+
+            tmp_vals = torch.concat((cur_topk_vals, topk.values))
+            tmp_inds = torch.concat((cur_topk_inds, topk.indices))
+            tmp_params = torch.concat((cur_topk_params, torch.full(topk.values.size(), self._param2id[name], dtype=torch.int, device=param.device)))
+
+            cur_topk = torch.topk(torch.abs(tmp_vals), k=min(torch.numel(tmp_vals), k), largest=False)
+            
+            cur_topk_vals = cur_topk.values
+            cur_topk_inds = tmp_inds[cur_topk.indices]
+            cur_topk_params = tmp_params[cur_topk.indices]
+
+            param[~mask] = 0
+
+        assert torch.numel(cur_topk_inds) == k
+        
+        for i in range(self._id_range):
+            m = cur_topk_params == i
+            n = torch.count_nonzero(m).item()
+            if n == 0:
+                continue
+
+            ind = cur_topk_inds[m]
+            param = self._id2param[i]
+
+            if debug:
+                print(f'    => removing {n} elements from {param}')
+
+            mask = getattr(self, f'_{param.replace(".", "_")}_prune_mask')
+
+            if self._l2:
+                mask[ind] = 0
+            else:
+                mask.view(-1)[ind] = 0
+
+            self._sizes[param] -= n
+        
+        self._numel -= k
+    
+    def get_pruning_metadata(self):
+        rate = self._fixed_rate or 0
+        return {'non_zero': self._numel, 'pct_orig': (1 - rate) ** self._num_pruned}
+
+    def forward(self, idx, targets=None):
+        with torch.no_grad():
+            if self._is_first_forward:
+                self._num_nonzero = 0
+            for name, param in self.named_parameters():
+                if 'weight' not in name:
+                    continue
+                param.data *= getattr(self, f'_{name.replace(".", "_")}_prune_mask')
+                if self._is_first_forward:
+                    nonzero = torch.count_nonzero(param).item()
+                    if self._l2 and param.dim() == 2:
+                        rem_c_mask = self._rem_channels[name]
+                        param.data = param.data[rem_c_mask]
+                        orig_shape = self._shapes[param]
+                        
+                        assert orig_shape[0] > param.data.size(0)
+
+                        self._shapes[param] = param.data.size()
+                
+
+
+
+                    self._num_nonzero += nonzero
+        
+        if self._is_first_forward:
+            print(f'number of non-pruned weights ({"L1" if not self._l2 else "L2"}): {self._num_nonzero}')
+        self._is_first_forward = False
+
+        return super().forward(idx, targets)
+    
+    # TODO: is repeating the only way,,,
+    @classmethod
+    def from_pretrained(cls, model_type, override_args=None):
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        override_args = override_args or {} # default to empty dict
+        # only dropout can be overridden see more notes below
+        # assert all(k == 'dropout' for k in override_args)
+        from transformers import GPT2LMHeadModel
+        print("loading weights from pretrained gpt: %s" % model_type)
+
+        # n_layer, n_head and n_embd are determined from model_type
+        config_args = {
+            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+        }[model_type]
+        print("forcing vocab_size=50257, block_size=1024, bias=True")
+        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
+        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
+        config_args['bias'] = True # always True for GPT model checkpoints
+        # we can override the dropout rate, if desired
+        if 'dropout' in override_args:
+            print(f"overriding dropout rate to {override_args['dropout']}")
+            config_args['dropout'] = override_args['dropout']
+        # create a from-scratch initialized minGPT model
+        config = GPTConfig(**config_args)
+        model = PruneableGPT(config, override_args['prune_l2'])
+        sd = model.state_dict()
+        sd_keys = sd.keys()
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias') and not k.endswith('_prune_mask')] # discard this mask / buffer, not a param
+
+        # init a huggingface/transformers model
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+
+        # copy while ensuring all of the parameters are aligned and match in names and shapes
+        sd_keys_hf = sd_hf.keys()
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+        # this means that we have to transpose these weights when we import them
+        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                # special treatment for the Conv1D weights we need to transpose
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                # vanilla copy over the other parameters
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
+
+        return model
